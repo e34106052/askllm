@@ -1,6 +1,6 @@
 from google.genai import types
 from forward_prediction import run_askcos_forward_prediction
-from retrosynthesis import run_askcos_retrosynthesis_outcomes
+from retrosynthesis import run_askcos_retrosynthesis
 from image_tool import generate_molecule_image
 from impurity_prediction import run_askcos_impurity_prediction
 from smiles_resolver import resolve_smiles_from_name
@@ -27,7 +27,7 @@ try:
     # 註冊所有 AskCOS 和圖像工具
     askcos_tools = [
         run_askcos_forward_prediction, 
-        run_askcos_retrosynthesis_outcomes, 
+        run_askcos_retrosynthesis, 
         generate_molecule_image,
         run_askcos_impurity_prediction,
         resolve_smiles_from_name,
@@ -93,7 +93,7 @@ def run_interactive_agent(user_prompt: str, tools_to_use: list, history: list) -
             if function_name == "run_askcos_forward_prediction":
                 tool_output = run_askcos_forward_prediction(**function_args)
             elif function_name == "run_askcos_retrosynthesis_outcomes":
-                tool_output = run_askcos_retrosynthesis_outcomes(**function_args)
+                tool_output = run_askcos_retrosynthesis(**function_args)
             elif function_name == "generate_molecule_image":
                 tool_output = generate_molecule_image(**function_args)
             elif function_name == "run_askcos_impurity_prediction":

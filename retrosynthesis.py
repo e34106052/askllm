@@ -6,7 +6,7 @@ import sys
 #  逆合成 URL 
 ASKCOS_RETRO_URL = "http://0.0.0.0:9410/predictions/reaxys" 
 
-def run_askcos_retrosynthesis_outcomes(smiles_list: List[str], max_routes: int = 3) -> str:
+def run_askcos_retrosynthesis(smiles_list: List[str], max_routes: int = 3) -> str:
     """
     使用 subprocess 調用 curl，執行 AskCOS reaxys 逆合成預測。
     此版本修正了覆雜的 JSON 列表解析問題，並匹配了最新的輸出結構。
