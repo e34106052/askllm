@@ -41,7 +41,12 @@ def resolve_smiles_from_name(compound_name: str) -> str:
             smiles = properties[0].get("SMILES")
             if smiles:
                 print(f"  -> 成功解析 SMILES: {smiles}")
-                return f"化合物 '{compound_name}' 的 SMILES 字符串是: {smiles}"
+                return (
+                f"【SMILES 解析結果】:\n"
+                f"化合物的英文名稱是 '{compound_name}'。\n"
+                f"其標準 SMILES 字符串是: **{smiles}**\n"
+                f"請根據此 SMILES 結果，以繁體中文向用戶生成最終的答案。"
+                )
             
         # 檢查是否有 PubChem API 錯誤信息
         if data.get("Fault"):

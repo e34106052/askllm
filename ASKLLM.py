@@ -17,8 +17,9 @@ except ImportError:
     sys.exit(1)
 # ----------------------------------------
 
-PRIMARY_MODEL = 'gemini-2.5-flash-lite'
-# PRIMARY_MODEL = 'gemini-2.5-pro'
+# 已採用 Pro 模型以增強推理和多工具調用能力
+PRIMARY_MODEL = 'gemini-2.5-pro'
+PRIMARY_MODEL = 'gemini-2.5-flash'
 BACKUP_MODEL = 'gemini-2.5-flash'
 
 # 初始化 Gemini 客戶端
@@ -37,25 +38,48 @@ except Exception as e:
     print(f"Gemini 客戶端初始化失敗：{e}")
     sys.exit(1)
 
-def run_interactive_agent(user_prompt: str, tools_to_use: list, history: list) -> str:
+def run_interactive_agent(user_prompt: str, history: List[types.Content], tools_to_use: list) -> str:
     """
-    處理單輪對話的核心函數，已禁用長期記憶，並強制模型在工具執行後返回結果。
+    處理單輪對話的核心函數，現已啟用上下文記憶，並強制模型在工具執行後返回結果。
+    
+    Args:
+        user_prompt: 當前用戶的查詢。
+        history: 包含先前對話的 Content 對象列表 (List[types.Content])。
+        tools_to_use: 可用的工具列表。
+        
+    Returns:
+        模型的最終中文回覆。
     """
     system_instruction = (
-        "您是一個多功能的 AI 助手，專注於化學。您的首要任務是回答用戶的化學相關問題。 "
-        "請務必遵循以下工具使用規則和優先級："
-        "\n1. **自我確認與翻譯**：如果用戶的查詢是關於化學的，您必須**首先將用戶輸入中的所有中文化合物名稱或術語翻譯成英文**，並使用英文名稱進行所有後續的工具調用。在第一次回應中，請將您翻譯的英文名稱顯示給自己確認。"
-        "\n2. **多步調用**：為了解決單一複雜問題（例如：名稱到產物圖片），您可以在第一次工具調用完成後，根據其結果**繼續調用其他必要的工具**，直到問題完全解決為止。**您不一定要在每次工具調用後立即生成最終回答**。"
-        "\n3. **名稱解析優先**：在您確認了英文名稱後，如果查詢是使用化合物名稱而不是 SMILES 字符串，您必須**調用 `resolve_smiles_from_name` 工具**來獲取 SMILES。"
-        "\n4. **工具調用**：只有在獲得所有必要的 SMILES 字符串後，才能調用 AskCOS 工具（如 `run_askcos_forward_prediction` 或 `run_askcos_retrosynthesis_outcomes`）。"
-        "\n5. **條件預測**：當用戶詢問**反應條件、溶劑或催化劑**時，您必須使用 `run_askcos_condition_prediction` 工具。請確保將反應 SMILES (RCTS>>PRD) 作為參數傳入。"
-        "\n6. **非化學問題**：對於簡單的數學、常識或閒聊問題，請直接使用您的自身知識以中文作答，不要調用工具。"
+        "The agent's primary function is to act as a professional chemistry assistant using the provided tools (AskCOS and image generation). "
+        "Your ultimate goal is to generate a helpful final response based on the tool outputs. "
+        "\n"
+        "1. **Output Language**: Your final response to the user **must always be in Traditional Chinese (繁體中文)**, regardless of the intermediate steps or tool names."
+        "\n"
+        "2. **Priority 1: Name Resolution**: If the user's query contains a chemical compound name (e.g., Aspirin, 乙酸乙酯), you must first translate the name into English, and then use the `resolve_smiles_from_name` tool to obtain the SMILES string. This step is mandatory before calling any core AskCOS service (Retrosynthesis, Forward, Impurity, Condition)."
+        "\n"
+        "3. **Priority 2: Chemical Tasks**: Once the SMILES string is obtained, call the appropriate AskCOS tool based on the user's intent (e.g., `run_askcos_retrosynthesis` for synthesis path, `run_askcos_forward_prediction` for reaction product, `generate_molecule_image` for structure)."
+        "\n"
+        "4. **Multi-Step Tool Use**: You are permitted and encouraged to perform multi-step reasoning and tool calling (e.g., Name -> SMILES -> AskCOS Service)."
+        "\n"
+        "5. **Non-Chemical Questions**: For general knowledge, mathematics, or simple conversation, answer directly using your knowledge base without calling any tools."
+        "\n"
+        "6. **Final Response Guarantee (CRITICAL)**: After all necessary tools have been executed and the final data is available, you **must generate a clear, complete summary in Traditional Chinese as the final response**. **You must never return an empty text.** If a tool returns a result, you must summarize it."
     )
     
     current_model = PRIMARY_MODEL
-    full_conversation = [user_prompt] # 由於禁用記憶，只傳遞當前提示
     
-    # 辅助函数：调用模型 (保持不變)
+    # --- 記憶功能相關變量 ---
+    tool_call_made = False 
+    last_tool_output_result = None
+    
+    # 構造當前輪次的用戶提示 (User Content)
+    current_user_content = types.Content(role="user", parts=[types.Part(text=str(user_prompt))])
+    
+    # 構造完整的對話上下文：過去的歷史 + 當前用戶的提示
+    contents = history + [current_user_content] 
+    
+    # 辅助函數：調用模型 (保持不變)
     def call_model(model_name: str, contents: List[Union[str, types.Content, types.Part]], tools: list) -> types.GenerateContentResponse:
         return client.models.generate_content(
             model=model_name,
@@ -66,11 +90,10 @@ def run_interactive_agent(user_prompt: str, tools_to_use: list, history: list) -
             ),
         )
 
-    last_tool_output_result = None #  儲存最新的工具輸出結果字符串
-
     # --- 1. 階段一：初次調用和模型切換 ---
     try:
-        response = call_model(current_model, full_conversation, tools_to_use)
+        # 第一次調用：將完整的歷史傳遞給模型
+        response = call_model(current_model, contents, tools_to_use)
     except Exception as e:
         # ... (模型切換和錯誤處理邏輯不變)
         return f"主備模型均調用失敗，請檢查 API Key 或配額。\n主模型錯誤: {e}\n備用模型錯誤:"
@@ -79,7 +102,8 @@ def run_interactive_agent(user_prompt: str, tools_to_use: list, history: list) -
     while response.function_calls:
         print(f"\n[ Agent] 正在使用 ({current_model}) 發現需要外部工具來回答問題...")
         
-        model_request = response.candidates[0].content 
+        tool_call_made = True # 標記本輪有工具調用
+        model_request_content = response.candidates[0].content 
         tool_outputs = []
         
         for tool_call in response.function_calls:
@@ -92,8 +116,9 @@ def run_interactive_agent(user_prompt: str, tools_to_use: list, history: list) -
             # 執行工具 (邏輯不變)
             if function_name == "run_askcos_forward_prediction":
                 tool_output = run_askcos_forward_prediction(**function_args)
-            elif function_name == "run_askcos_retrosynthesis_outcomes":
-                tool_output = run_askcos_retrosynthesis(**function_args)
+            elif function_name == "run_askcos_retrosynthesis":
+                # 注意：這裡應該是 run_askcos_retrosynthesis，確保與 import 一致
+                tool_output = run_askcos_retrosynthesis(**function_args) 
             elif function_name == "generate_molecule_image":
                 tool_output = generate_molecule_image(**function_args)
             elif function_name == "run_askcos_impurity_prediction":
@@ -105,7 +130,7 @@ def run_interactive_agent(user_prompt: str, tools_to_use: list, history: list) -
             else:
                 tool_output = f"未知的工具 {function_name}"
             
-            last_tool_output_result = tool_output #  持久化最新的工具輸出
+            last_tool_output_result = tool_output # 持久化最新的工具輸出
             
             print(f"  -> 工具執行結果: {tool_output}")
             
@@ -116,29 +141,45 @@ def run_interactive_agent(user_prompt: str, tools_to_use: list, history: list) -
                     response={"tool_result": tool_output},
                 )
             )
+        
+        # 將工具輸出包裝成 Content 對象
+        tool_outputs_content = types.Content(role="tool", parts=tool_outputs)
 
         # 3. 階段二：將工具執行結果反饋給模型
-        # contents_feedback = 當前用戶提示 + 模型請求 + 工具輸出
-        contents_feedback = full_conversation + [model_request] + tool_outputs
+        # 構造用於第二次調用的內容：完整歷史 (contents) + 第一次響應 (模型請求) + 工具輸出
+        contents_feedback = contents + [model_request_content] + [tool_outputs_content]
         
         try:
+            # 第二次調用：模型根據工具結果生成最終回覆或下一個工具調用
             response = call_model(current_model, contents_feedback, tools_to_use)
+            
+            # 如果模型在第二次調用中決定繼續調用工具，則 contents 必須更新，以包含中間步驟
+            # 更新 contents 以便下一個 while 循環使用完整的歷史
+            contents = contents_feedback 
+            
         except Exception as e:
             return f"模型 {current_model} 在工具調用反饋階段失敗: {e}"
         
     # 4. Agent 給出最終回覆
     final_response_text = response.text
     
-    #  關鍵修正：強制模型回答
-    if final_response_text is None:
+    # 5. **新增：更新對話歷史記錄 (記憶功能)**
+    if response.candidates and response.candidates[0].content:
+        # 1. 記錄用戶請求
+        history.append(current_user_content) 
+        
+        # 2. 記錄模型的最終響應 (包含最終文本、或僅包含工具呼叫，或空文本)
+        # 注意：使用 response.candidates[0].content 捕捉模型生成的整個 Content 對象
+        history.append(response.candidates[0].content)
+
+    # 6. 關鍵修正：強制模型回答
+    if final_response_text is None or final_response_text.strip() == "":
         if last_tool_output_result is not None:
-            #  返回清晰的強制文本，包含最後一次成功的工具結果
+            # 返回清晰的強制文本，包含最後一次成功的工具結果
             final_response_text = f"Agent 成功執行所有工具，但模型未能生成完整總結。以下是最後一次工具的結果：\n{last_tool_output_result}"
         else:
             final_response_text = "Agent 完成計算，但模型返回了空響應。"
-    
-    # 由於已禁用記憶，無需處理 history.extend
-    
+            
     return final_response_text
 
 # --- 主交互循環 ---
@@ -147,8 +188,8 @@ def main_loop():
     print("您可以查詢正向預測、逆合成和分子結構圖。")
     print("輸入 'exit' 或 'quit' 退出程序。")
     
-    # 雖然存在，但在 run_interactive_agent 中已被忽略
-    chat_history = [] 
+    # 啟用對話歷史：使用 List[types.Content] 存儲上下文
+    chat_history: List[types.Content] = [] 
     
     while True:
         try:
@@ -161,11 +202,10 @@ def main_loop():
             if not user_input.strip():
                 continue
 
-            # 運行 Agent (每次都是獨立的單輪會話)
-            final_answer = run_interactive_agent(user_input, askcos_tools, chat_history)
+            # 運行 Agent。chat_history 會在 run_interactive_agent 內部更新
+            final_response = run_interactive_agent(user_input, chat_history, askcos_tools) 
             
-            print("\n[ Agent] 最終回覆:")
-            print(final_answer)
+            print(f"\n[ Agent] 最終回覆:\n{final_response}")
             
         except Exception as e:
             print(f"\n[ 錯誤] 發生意外錯誤: {e}")
