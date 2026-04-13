@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.askllm_memory/
+.askllm_cache/
+outputs/
+generated_mol_images/

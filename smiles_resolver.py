@@ -2,6 +2,7 @@ import requests
 import json
 from typing import Optional
 from urllib.parse import quote # 用於 URL 編碼
+import cache_utils as cache
 
 PUBCHEM_API_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound"
 
@@ -23,6 +24,14 @@ def resolve_smiles_from_name(compound_name: str) -> str:
     encoded_name = quote(compound_name)
     
     url = f"{PUBCHEM_API_BASE}/name/{encoded_name}/property/SMILES/JSON"
+    cache_key = cache.build_key(
+        "pubchem:smiles_from_name:v2",
+        compound_name=compound_name.strip().lower(),
+    )
+    cached = cache.get(cache_key)
+    if isinstance(cached, str) and cached.strip():
+        print(f"  -> 命中快取：PubChem 名稱解析 {compound_name}")
+        return cached
     
     print(f" 正在請求 PubChem API 解析化合物名稱: {compound_name}...")
     
@@ -41,12 +50,14 @@ def resolve_smiles_from_name(compound_name: str) -> str:
             smiles = properties[0].get("SMILES")
             if smiles:
                 print(f"  -> 成功解析 SMILES: {smiles}")
-                return (
+                final_text = (
                 f"【SMILES 解析結果】:\n"
                 f"化合物的英文名稱是 '{compound_name}'。\n"
                 f"其標準 SMILES 字符串是: **{smiles}**\n"
                 f"請根據此 SMILES 結果，以繁體中文向用戶生成最終的答案。"
                 )
+                cache.set(cache_key, final_text)
+                return final_text
             
         # 檢查是否有 PubChem API 錯誤信息
         if data.get("Fault"):

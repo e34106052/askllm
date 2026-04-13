@@ -1,33 +1,42 @@
-# askllm_api.py
 from flask import Flask, request, jsonify
 from ASKLLM import run_interactive_agent, askcos_tools
-from google.genai import types
+from providers import QuotaLimitError
 
 app = Flask(__name__)
 
-# 全局對話歷史（單一會話用，之後你可以改成用 session_id 做多使用者）
-chat_history = []  # List[types.Content]
+# 以 session_id 維護多會話歷史；預設走 "default"
+chat_histories = {}
 
 @app.route("/askllm", methods=["POST"])
 def askllm():
     data = request.get_json(force=True)
     query = data.get("query", "").strip()
+    session_id = str(data.get("session_id", "default")).strip() or "default"
 
     if not query:
         return jsonify({"error": "query is required"}), 400
 
+    history = chat_histories.setdefault(session_id, [])
     try:
-        # 這裡 run_interactive_agent 裡面會自己用 chat_history 更新記憶
         answer = run_interactive_agent(
             user_prompt=query,
-            history=chat_history,
+            history=history,
             tools_to_use=askcos_tools,
         )
         return jsonify({
+            "session_id": session_id,
             "answer": answer
         })
+    except QuotaLimitError as e:
+        return jsonify(
+            {
+                "session_id": session_id,
+                "error": str(e),
+                "action": "請稍後重試、切換模型，或檢查 API key 配額設定。",
+            }
+        ), 429
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"session_id": session_id, "error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001)

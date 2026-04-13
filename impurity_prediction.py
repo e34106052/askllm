@@ -1,6 +1,7 @@
 import json
 import subprocess
 from typing import List, Optional
+import cache_utils as cache
 
 # AskCOS 雜質預測服務的確切 URL
 ASKCOS_IMPURITY_URL = "http://0.0.0.0:9691/impurity" 
@@ -25,6 +26,15 @@ def run_askcos_impurity_prediction(
         "rea_smi": reagent_smiles
     }
     payload_str = json.dumps(payload_data)
+    cache_key = cache.build_key(
+        "askcos:impurity:v2",
+        url=ASKCOS_IMPURITY_URL,
+        payload=payload_data,
+    )
+    cached = cache.get(cache_key)
+    if isinstance(cached, str) and cached.strip():
+        print("  -> 命中快取：AskCOS 雜質預測")
+        return cached
     
     command = [
         "curl", ASKCOS_IMPURITY_URL,
@@ -95,6 +105,7 @@ def run_askcos_impurity_prediction(
             f"(形成模式: {expand_results[0].get('modes_name', 'N/A')})"
         )
         
+        cache.set(cache_key, final_summary)
         return final_summary
         
     except subprocess.CalledProcessError as e:

@@ -1,6 +1,7 @@
 import json
 import subprocess
 from typing import List, Optional
+import cache_utils as cache
 
 # AskCOS 反應條件預測服務的 URL
 ASKCOS_CONDITION_URL = "http://0.0.0.0:9901/api/v2/condition/GRAPH" 
@@ -34,6 +35,15 @@ def run_askcos_condition_prediction(
         "n_conditions": n_conditions
     }
     payload_str = json.dumps(payload_data)
+    cache_key = cache.build_key(
+        "askcos:condition:graph:v2",
+        url=ASKCOS_CONDITION_URL,
+        payload=payload_data,
+    )
+    cached = cache.get(cache_key)
+    if isinstance(cached, str) and cached.strip():
+        print("  -> 命中快取：AskCOS GRAPH 條件預測")
+        return cached
     
     command = [
         "curl", ASKCOS_CONDITION_URL,
@@ -117,6 +127,7 @@ def run_askcos_condition_prediction(
             f"以下是您請求的前 {limit} 名條件的詳細信息:\n"
         )
         final_summary += "\n".join(summary_parts)
+        cache.set(cache_key, final_summary)
         return final_summary
         
     except subprocess.CalledProcessError as e:
@@ -124,3 +135,26 @@ def run_askcos_condition_prediction(
         return f"調用 AskCOS API 失敗，請檢查服務是否運行在 9901 端口。錯誤詳情:\n{error_output}"
     except Exception as e:
         return f"發生未知錯誤或 JSON 解析失敗: {e}"
+
+
+def run_askcos_condition_prediction_compare(
+    reaction_smiles: str,
+    reagents: Optional[List[str]] = None,
+    n_conditions: int = 5,
+) -> str:
+    from context_quarc import run_askcos_quarc_prediction
+
+    graph_text = run_askcos_condition_prediction(
+        reaction_smiles=reaction_smiles,
+        reagents=reagents,
+        n_conditions=n_conditions,
+    )
+    quarc_text = run_askcos_quarc_prediction(
+        reaction_smiles=reaction_smiles,
+        reagents=reagents,
+        n_conditions=n_conditions,
+    )
+    return (
+        "以下是 GRAPH 與 QUARC 兩種條件預測結果，請比較它們的溫度、條件組成與得分差異：\n\n"
+        f"=== GRAPH ===\n{graph_text}\n\n=== QUARC ===\n{quarc_text}"
+    )
