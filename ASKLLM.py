@@ -64,6 +64,9 @@ GROQ_AUX_MODEL = os.environ.get("ASKLLM_GROQ_AUX_MODEL", "llama-3.1-8b-instant")
 GROQ_PLANNER_MODEL = os.environ.get("ASKLLM_GROQ_PLANNER_MODEL", "llama-3.1-8b-instant")
 GROQ_CRITIC_MODEL = os.environ.get("ASKLLM_GROQ_CRITIC_MODEL", "llama-3.1-8b-instant")
 GROQ_SKILL_ROUTER_MODEL = os.environ.get("ASKLLM_GROQ_SKILL_ROUTER_MODEL", "llama-3.1-8b-instant")
+GROQ_SIMPLE_MODEL = os.environ.get("ASKLLM_GROQ_SIMPLE_MODEL", "llama-3.1-8b-instant")
+# 複雜任務預設改走 Gemini（避免 70b rate limit），可用環境變數覆蓋。
+GROQ_COMPLEX_MODEL = os.environ.get("ASKLLM_GROQ_COMPLEX_MODEL", PRIMARY_MODEL)
 
 DECISION_PROVIDER = os.environ.get("ASKLLM_DECISION_PROVIDER", "gemini").lower()
 PLANNER_PROVIDER = os.environ.get("ASKLLM_PLANNER_PROVIDER", DECISION_PROVIDER).lower()
@@ -167,6 +170,51 @@ def _extract_json_block(text: str) -> Dict[str, Any]:
         return {}
 
 
+def _is_simple_task(user_prompt: str) -> bool:
+    q = (user_prompt or "").strip()
+    ql = q.lower()
+    if not q:
+        return True
+    complex_markers = [
+        "比較",
+        "compare",
+        "對比",
+        "多工具",
+        "multi tool",
+        "mcts",
+        "多步",
+        "路徑",
+        "策略",
+        "a/b/c",
+        "replan",
+        "評估",
+    ]
+    if any(token in ql for token in complex_markers):
+        return False
+    return len(q) <= 80
+
+
+def _pick_groq_model_for_task(
+    *,
+    user_prompt: str,
+    task_type: str,
+    adaptive_plan: Dict[str, Any] = None,
+) -> str:
+    is_simple = _is_simple_task(user_prompt)
+    if task_type == "decision":
+        if adaptive_plan:
+            compare_allowed = adaptive_plan.get("compare_allowed")
+            multistep_requested = adaptive_plan.get("multistep_requested")
+            if compare_allowed or multistep_requested:
+                return GROQ_COMPLEX_MODEL
+        return GROQ_SIMPLE_MODEL if is_simple else GROQ_COMPLEX_MODEL
+    if task_type == "planner":
+        return GROQ_SIMPLE_MODEL if is_simple else GROQ_PLANNER_MODEL
+    if task_type == "critic":
+        return GROQ_SIMPLE_MODEL if is_simple else GROQ_CRITIC_MODEL
+    return GROQ_SIMPLE_MODEL
+
+
 def _chat_with_gemini_text(prompt: str, model: str, system_instruction: str = "", timeout_sec: int = 60) -> str:
     if client is None:
         raise RuntimeError("未設定 GEMINI_API_KEY，無法使用 Gemini。")
@@ -186,7 +234,11 @@ def _generate_text(
     system_instruction: str = "",
     timeout_sec: int = 60,
 ) -> str:
-    provider = (provider or "gemini").lower()
+    original_provider = (provider or "gemini").lower()
+    provider = original_provider
+    # 允許在 groq 路徑下動態切換到 Gemini 模型（例如複雜任務）。
+    if provider == "groq" and str(model).startswith("gemini"):
+        provider = "gemini"
     if provider == "groq":
         messages = []
         if system_instruction:
@@ -195,12 +247,13 @@ def _generate_text(
         return chat_with_groq(messages=messages, model=model, timeout_sec=timeout_sec)
 
     try:
-        return _chat_with_gemini_text(
+        gemini_text = _chat_with_gemini_text(
             prompt=prompt,
             model=model,
             system_instruction=system_instruction,
             timeout_sec=timeout_sec,
         )
+        return gemini_text
     except Exception as primary_error:
         if model != BACKUP_MODEL:
             try:
@@ -211,11 +264,26 @@ def _generate_text(
                     timeout_sec=timeout_sec,
                 )
             except Exception as backup_error:
-                return (
+                gemini_error_text = (
                     "主備模型均調用失敗，請檢查 API Key 或配額。\n"
                     f"主模型錯誤: {primary_error}\n"
                     f"備用模型錯誤: {backup_error}"
                 )
+                # 若原本是 Groq 路徑但複雜任務暫切 Gemini，Gemini 失敗時自動降回 Groq 8b。
+                if original_provider == "groq":
+                    try:
+                        messages = []
+                        if system_instruction:
+                            messages.append({"role": "system", "content": system_instruction})
+                        messages.append({"role": "user", "content": prompt})
+                        return chat_with_groq(
+                            messages=messages,
+                            model=GROQ_SIMPLE_MODEL,
+                            timeout_sec=timeout_sec,
+                        )
+                    except Exception:
+                        return gemini_error_text
+                return gemini_error_text
         raise
 
 
@@ -224,7 +292,11 @@ def _route_skills_with_ai(user_prompt: str) -> List[str]:
         return []
     available_files = ["02-ambiguity.md", "03-name-resolution.md", "04-condition-priority.md", "05-task-routing.md", "06-formatting.md"]
     provider = SKILL_ROUTER_PROVIDER
-    model = GROQ_SKILL_ROUTER_MODEL if provider == "groq" else SKILL_ROUTER_MODEL
+    model = (
+        _pick_groq_model_for_task(user_prompt=user_prompt, task_type="planner")
+        if provider == "groq"
+        else SKILL_ROUTER_MODEL
+    )
     prompt = (
         "請根據使用者問題，從以下 skill 檔案中挑選最相關者，"
         "只輸出 JSON：{\"files\":[...]}。\n"
@@ -362,7 +434,11 @@ def _build_adaptive_plan(user_prompt: str, tools_to_use: list) -> Dict[str, Any]
         return heuristic
 
     planner_provider = PLANNER_PROVIDER
-    planner_model = GROQ_PLANNER_MODEL if planner_provider == "groq" else PLANNER_MODEL
+    planner_model = (
+        _pick_groq_model_for_task(user_prompt=user_prompt, task_type="planner")
+        if planner_provider == "groq"
+        else PLANNER_MODEL
+    )
     prompt = (
         "你是 AskLLM 的 adaptive planner。請輸出 JSON，欄位包含："
         "intent, tool_candidates, compare_allowed, max_tool_calls, reasoning。"
@@ -554,11 +630,11 @@ def _summarize_tool_output(tool_name: str, raw_output: str) -> str:
 
 
 def _pick_groq_decision_model(adaptive_plan: Dict[str, Any], user_prompt: str) -> str:
-    compare_allowed = adaptive_plan.get("compare_allowed")
-    multistep_requested = adaptive_plan.get("multistep_requested")
-    if compare_allowed or multistep_requested or len(user_prompt) > 120:
-        return GROQ_DECISION_MODEL
-    return GROQ_AUX_MODEL
+    return _pick_groq_model_for_task(
+        user_prompt=user_prompt,
+        task_type="decision",
+        adaptive_plan=adaptive_plan or {},
+    )
 
 
 def _execute_tool(function_name: str, function_args: Dict[str, Any]) -> str:
@@ -577,7 +653,11 @@ def _run_critic(user_prompt: str, final_answer: str, used_tools: List[str], evid
     if not ENABLE_CRITIC:
         return ""
     provider = CRITIC_PROVIDER
-    model = GROQ_CRITIC_MODEL if provider == "groq" else CRITIC_MODEL
+    model = (
+        _pick_groq_model_for_task(user_prompt=user_prompt, task_type="critic")
+        if provider == "groq"
+        else CRITIC_MODEL
+    )
     try:
         return _generate_text(
             prompt=(
