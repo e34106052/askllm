@@ -227,9 +227,9 @@ def _run_backend(
 
 def run_askcos_multistep_retrosynthesis(
     target_smiles: str,
-    max_depth: int = 6,
-    max_paths: int = 5,
-    expansion_time: int = 45,
+    max_depth: int = 8,
+    max_paths: int = 200,
+    expansion_time: int = 300,
     max_branching: int = 25,
     retro_model_name: str = "reaxys",
     max_num_templates: int = 200,
@@ -278,9 +278,9 @@ def run_askcos_multistep_retrosynthesis(
 
 def run_askcos_multistep_retrosynthesis_retro_star(
     target_smiles: str,
-    max_depth: int = 6,
-    max_paths: int = 5,
-    expansion_time: int = 45,
+    max_depth: int = 8,
+    max_paths: int = 200,
+    expansion_time: int = 300,
     max_branching: int = 25,
     retro_model_name: str = "reaxys",
     max_num_templates: int = 200,
@@ -328,9 +328,9 @@ def run_askcos_multistep_retrosynthesis_retro_star(
 
 def run_askcos_multistep_retrosynthesis_compare(
     target_smiles: str,
-    max_depth: int = 6,
-    max_paths: int = 5,
-    expansion_time: int = 45,
+    max_depth: int = 8,
+    max_paths: int = 200,
+    expansion_time: int = 300,
     retro_model_name: str = "reaxys",
     use_cache: bool = True,
 ) -> str:
@@ -356,15 +356,18 @@ def run_askcos_multistep_retrosynthesis_compare(
 def run_askcos_multistep_retrosynthesis_async_submit(
     target_smiles: str,
     backend: str = "mcts",
-    max_depth: int = 6,
-    max_paths: int = 5,
-    expansion_time: int = 180,
+    max_depth: int = 8,
+    max_paths: int = 200,
+    expansion_time: int = 300,
     max_branching: int = 25,
     retro_model_name: str = "reaxys",
     max_num_templates: int = 200,
     top_k: int = 20,
     threshold: float = 0.15,
     sorting_metric: str = "plausibility",
+    auto_analyze: bool = True,
+    analyze_objective: str = "balanced",
+    analyze_top_n: int = 10,
     use_cache: bool = True,
 ) -> str:
     if not target_smiles:
@@ -396,9 +399,14 @@ def run_askcos_multistep_retrosynthesis_async_submit(
             "top_k": int(top_k),
             "threshold": float(threshold),
             "sorting_metric": sorting_metric,
+            "auto_analyze": bool(auto_analyze),
+            "analyze_objective": analyze_objective,
+            "analyze_top_n": int(analyze_top_n),
             "use_cache": bool(use_cache),
         },
         "result_file": _result_file_path(job_id),
+        "analysis_file": os.path.join(ASYNC_JOBS_DIR, f"{job_id}.analysis.txt"),
+        "analysis_status": "pending" if auto_analyze else "skipped",
     }
     _write_job(job_id, payload)
 
@@ -441,6 +449,9 @@ def run_askcos_multistep_retrosynthesis_async_status(job_id: str) -> str:
         lines.append(f"- ended_at: {job.get('ended_at')}")
     if job.get("error"):
         lines.append(f"- error: {job.get('error')}")
+    lines.append(f"- analysis_status: {job.get('analysis_status', 'unknown')}")
+    if job.get("analysis_error"):
+        lines.append(f"- analysis_error: {job.get('analysis_error')}")
     return "\n".join(lines)
 
 
@@ -466,6 +477,15 @@ def run_askcos_multistep_retrosynthesis_async_result(job_id: str) -> str:
             text = f.read().strip()
         if not text:
             return f"任務已完成（job_id={job_id}），但結果為空。"
+        analysis_file = str(job.get("analysis_file") or "")
+        if analysis_file and os.path.exists(analysis_file):
+            try:
+                with open(analysis_file, "r", encoding="utf-8") as af:
+                    atext = af.read().strip()
+                if atext:
+                    return text + "\n\n=== 自動四 critic 分析 ===\n" + atext
+            except Exception:
+                pass
         return text
     except Exception as e:
         return f"讀取背景任務結果失敗（job_id={job_id}）：{e}"

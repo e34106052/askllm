@@ -45,6 +45,10 @@ from policies import (
 )
 from providers import QuotaLimitError, chat_with_groq, format_quota_help_message
 from route_recommendation import run_askcos_route_recommendation
+from route_recommendation import (
+    run_askcos_route_recommendation_feedback,
+    run_askcos_route_recommendation_recent_logs,
+)
 from retrosynthesis import (
     run_askcos_retrosynthesis,
     run_askcos_retrosynthesis_compare,
@@ -415,6 +419,13 @@ def _build_heuristic_plan(user_prompt: str, available_tool_names: List[str]) -> 
         candidates.append("run_askcos_impurity_prediction")
     if any(k in lower for k in ["推薦路線", "路線推薦", "最便宜", "成功率最高", "highest_success", "cheapest"]):
         candidates.append("run_askcos_route_recommendation")
+    if any(k in lower for k in ["回饋", "feedback", "accepted", "rejected", "eval_id", "recent logs"]):
+        candidates.extend(
+            [
+                "run_askcos_route_recommendation_recent_logs",
+                "run_askcos_route_recommendation_feedback",
+            ]
+        )
     if len(candidates) == 1:
         candidates.extend(
             [
@@ -617,11 +628,11 @@ def _default_args_for_tool(tool_name: str, user_prompt: str, resolved_smiles: st
             return {
                 "target_smiles": molecule_smiles,
                 "backend": "mcts",
-                "max_depth": 6,
-                "max_paths": 8,
-                "expansion_time": 180,
+                "max_depth": 8,
+                "max_paths": 200,
+                "expansion_time": 300,
             }
-        return {"target_smiles": molecule_smiles, "max_depth": 6, "max_paths": 5, "expansion_time": 45}
+        return {"target_smiles": molecule_smiles, "max_depth": 8, "max_paths": 200, "expansion_time": 300}
     if tool_name == "run_askcos_route_recommendation":
         objective = "balanced"
         lower = (user_prompt or "").lower()
@@ -654,6 +665,10 @@ def _default_args_for_tool(tool_name: str, user_prompt: str, resolved_smiles: st
             "constraint_parse_mode": "hybrid",
             "constraints": merged_constraints,
         }
+    if tool_name == "run_askcos_route_recommendation_recent_logs":
+        return {"limit": 5}
+    if tool_name == "run_askcos_route_recommendation_feedback":
+        return {"eval_id": "", "route_id": 1, "decision": "needs_review", "reason": user_prompt[:120]}
     if tool_name.startswith("run_askcos_forward_prediction"):
         reactants = reaction_smiles.split(".") if reaction_smiles and ">>" not in reaction_smiles else ([molecule_smiles] if molecule_smiles else [])
         return {"reactants_smiles_list": reactants, "top_k": 3}
@@ -755,6 +770,17 @@ def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
         cleaned.setdefault("constraint_parse_mode", "hybrid")
         cleaned.setdefault("constraints", {})
         cleaned.setdefault("use_cache", True)
+    if tool_name == "run_askcos_route_recommendation_recent_logs":
+        cleaned.setdefault("limit", 5)
+    if tool_name == "run_askcos_route_recommendation_feedback":
+        if "id" in cleaned and "eval_id" not in cleaned:
+            cleaned["eval_id"] = cleaned.pop("id")
+        if "route" in cleaned and "route_id" not in cleaned:
+            cleaned["route_id"] = cleaned.pop("route")
+        cleaned.setdefault("eval_id", "")
+        cleaned.setdefault("route_id", 1)
+        cleaned.setdefault("decision", "needs_review")
+        cleaned.setdefault("reason", "")
 
     if tool_name == "run_askcos_impurity_prediction":
         if "reaction_smiles" in cleaned and "reactants_smiles" not in cleaned:
@@ -1228,6 +1254,8 @@ askcos_tools = [
     run_askcos_multistep_retrosynthesis_async_status,
     run_askcos_multistep_retrosynthesis_async_result,
     run_askcos_route_recommendation,
+    run_askcos_route_recommendation_recent_logs,
+    run_askcos_route_recommendation_feedback,
     run_askcos_impurity_prediction,
     resolve_smiles_from_name,
     run_askcos_condition_prediction,
