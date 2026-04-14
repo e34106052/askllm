@@ -37,6 +37,8 @@
   - `run_askcos_retrosynthesis_template_enum`
   - `run_askcos_retrosynthesis_compare`
   - `run_askcos_multistep_retrosynthesis`（MCTS）
+  - `run_askcos_multistep_retrosynthesis_retro_star`（Retro*）
+  - `run_askcos_multistep_retrosynthesis_compare`（MCTS vs Retro*）
 - 正向預測
   - `run_askcos_forward_prediction`
   - `run_askcos_forward_prediction_uspto_stereo`
@@ -72,6 +74,7 @@
 
 ## 記憶與指令
 
+- Skill 片段由 `skills/00-core.md` 等檔組合；若讀檔全失敗，後備內容同樣取自 `00-core.md`（已移除重複的 `chemistry_assistant_skill.md`）。
 - 持久記憶檔：`.askllm_memory/memory_state.json`
 - 支援欄位：`summary_zh`、`turns`、`current_topic`、`topics`、`meta_reflections`
 - CLI 指令

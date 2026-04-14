@@ -24,7 +24,11 @@ from forward_prediction import (
 )
 from image_tool import generate_molecule_image
 from impurity_prediction import run_askcos_impurity_prediction
-from multistep_retrosynthesis import run_askcos_multistep_retrosynthesis
+from multistep_retrosynthesis import (
+    run_askcos_multistep_retrosynthesis,
+    run_askcos_multistep_retrosynthesis_compare,
+    run_askcos_multistep_retrosynthesis_retro_star,
+)
 from orchestrator import run_groq_turn
 from policies import (
     extract_name_candidate,
@@ -36,7 +40,6 @@ from policies import (
     recent_effective_evidence,
 )
 from providers import QuotaLimitError, chat_with_groq, format_quota_help_message
-from reaction_yield import run_advanced_condition_prediction
 from retrosynthesis import (
     run_askcos_retrosynthesis,
     run_askcos_retrosynthesis_compare,
@@ -84,7 +87,7 @@ ENABLE_META_REFLECTION = os.environ.get("ASKLLM_ENABLE_META_REFLECTION", "1") ==
 ENABLE_ADAPTIVE_POLICY = os.environ.get("ASKLLM_ENABLE_ADAPTIVE_POLICY", "1") == "1"
 
 SKILLS_DIR = os.path.join(os.path.dirname(__file__), "skills")
-SKILL_FALLBACK_FILE = os.path.join(SKILLS_DIR, "chemistry_assistant_skill.md")
+SKILL_FALLBACK_FILE = os.path.join(SKILLS_DIR, "00-core.md")
 BASE_SKILL_FILES = [
     "00-core.md",
     "01-language.md",
@@ -373,9 +376,16 @@ def _build_heuristic_plan(user_prompt: str, available_tool_names: List[str]) -> 
     if any(k in lower for k in ["逆合成", "retrosynthesis", "合成路徑"]):
         candidates.extend(["run_askcos_retrosynthesis"])
         if multistep:
-            candidates.append("run_askcos_multistep_retrosynthesis")
+            candidates.extend(
+                [
+                    "run_askcos_multistep_retrosynthesis",
+                    "run_askcos_multistep_retrosynthesis_retro_star",
+                ]
+            )
         if compare_allowed:
             candidates.append("run_askcos_retrosynthesis_compare")
+            if multistep:
+                candidates.append("run_askcos_multistep_retrosynthesis_compare")
     if any(k in lower for k in ["正向", "forward", "產物", "product"]):
         candidates.append("run_askcos_forward_prediction")
         if compare_allowed:
@@ -405,7 +415,7 @@ def _build_heuristic_plan(user_prompt: str, available_tool_names: List[str]) -> 
             continue
         if not compare_allowed and name.endswith("_compare"):
             continue
-        if not multistep and name == "run_askcos_multistep_retrosynthesis":
+        if not multistep and name.startswith("run_askcos_multistep_retrosynthesis"):
             continue
         filtered.append(name)
 
@@ -499,7 +509,11 @@ def _filter_tools_for_turn(user_prompt: str, tools_to_use: list, adaptive_plan: 
     if not compare_allowed:
         selected = [tool for tool in selected if not getattr(tool, "__name__", str(tool)).endswith("_compare")]
     if not multistep_requested:
-        selected = [tool for tool in selected if getattr(tool, "__name__", str(tool)) != "run_askcos_multistep_retrosynthesis"]
+        selected = [
+            tool
+            for tool in selected
+            if not getattr(tool, "__name__", str(tool)).startswith("run_askcos_multistep_retrosynthesis")
+        ]
     return selected
 
 
@@ -520,7 +534,7 @@ def _default_args_for_tool(tool_name: str, user_prompt: str, resolved_smiles: st
         return {"compound_name": name_candidate or user_prompt}
     if tool_name.startswith("run_askcos_retrosynthesis"):
         return {"smiles_list": [molecule_smiles] if molecule_smiles else [], "max_routes": 3}
-    if tool_name == "run_askcos_multistep_retrosynthesis":
+    if tool_name.startswith("run_askcos_multistep_retrosynthesis"):
         return {"target_smiles": molecule_smiles, "max_depth": 6, "max_paths": 5, "expansion_time": 45}
     if tool_name.startswith("run_askcos_forward_prediction"):
         reactants = reaction_smiles.split(".") if reaction_smiles and ">>" not in reaction_smiles else ([molecule_smiles] if molecule_smiles else [])
@@ -569,7 +583,7 @@ def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
         if "top_k" in cleaned and "n_conditions" not in cleaned:
             cleaned["n_conditions"] = cleaned.pop("top_k")
 
-    if tool_name == "run_askcos_multistep_retrosynthesis":
+    if tool_name.startswith("run_askcos_multistep_retrosynthesis"):
         if "num_paths" in cleaned and "max_paths" not in cleaned:
             cleaned["max_paths"] = cleaned.pop("num_paths")
         if "max_steps" in cleaned and "max_depth" not in cleaned:
@@ -1045,6 +1059,8 @@ askcos_tools = [
     run_askcos_retrosynthesis_template_enum,
     run_askcos_retrosynthesis_compare,
     run_askcos_multistep_retrosynthesis,
+    run_askcos_multistep_retrosynthesis_retro_star,
+    run_askcos_multistep_retrosynthesis_compare,
     generate_molecule_image,
     run_askcos_impurity_prediction,
     resolve_smiles_from_name,
