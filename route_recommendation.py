@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import subprocess
@@ -450,6 +451,287 @@ def _objective_weights(objective: str) -> Dict[str, float]:
     return {"cost": 0.30, "success": 0.30, "safety": 0.20, "supply": 0.20}
 
 
+def _parse_constraint_text(constraint_text: str) -> Dict[str, Any]:
+    text = (constraint_text or "").strip()
+    if not text:
+        return {"hard": {}, "soft": {}}
+    lower = text.lower()
+    hard: Dict[str, Any] = {}
+    soft: Dict[str, Any] = {}
+    clauses = re.split(r"[，,。；;！!？?\n]+", text)
+
+    zh_num_map = {
+        "一": 1,
+        "二": 2,
+        "兩": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+    }
+
+    def _zh_num_to_int(s: str) -> int:
+        s = (s or "").strip()
+        if not s:
+            return 0
+        if s.isdigit():
+            return int(s)
+        if s == "十":
+            return 10
+        if "十" in s:
+            parts = s.split("十")
+            left = zh_num_map.get(parts[0], 1 if parts[0] == "" else 0)
+            right = zh_num_map.get(parts[1], 0) if len(parts) > 1 else 0
+            return left * 10 + right
+        return zh_num_map.get(s, 0)
+
+    def _is_hard_clause(c: str) -> bool:
+        cl = c.lower()
+        return any(k in cl for k in ["不能", "禁止", "不可", "must", "不得", "一定要", "必須", "ban", "avoid all"])
+
+    def _is_soft_clause(c: str) -> bool:
+        cl = c.lower()
+        return any(k in cl for k in ["盡量", "優先", "希望", "最好", "盡可能", "prefer", "ideally", "建議"])
+
+    for c in clauses:
+        c = c.strip()
+        if not c:
+            continue
+        is_hard = _is_hard_clause(c)
+        is_soft = _is_soft_clause(c) or not is_hard
+
+        # depth / 步數
+        m = re.search(
+            r"(?:(?:最多|至多|不超過|低於|小於|不能超過)\s*([0-9]+|[一二兩三四五六七八九十]{1,3})\s*步)|"
+            r"(?:([0-9]+|[一二兩三四五六七八九十]{1,3})\s*步內)|"
+            r"(?:max[_ ]?depth\s*([0-9]+))|"
+            r"(?:步數\s*(?:不超過|低於|小於|<=|<)\s*([0-9]+|[一二兩三四五六七八九十]{1,3}))",
+            c,
+            flags=re.I,
+        )
+        if m:
+            raw_n = ""
+            for idx in range(1, 6):
+                part = m.group(idx)
+                if part:
+                    raw_n = str(part).strip()
+                    break
+            n = _zh_num_to_int(raw_n)
+            if n > 0:
+                if is_hard:
+                    hard["max_depth"] = n
+                elif is_soft:
+                    soft["max_depth"] = n
+
+        # 成本上限（支援「成本 50 以下 / 不要太貴 / 便宜優先」）
+        m = re.search(
+            r"(成本|cost|價格|花費)\s*(<=|<|不超過|低於|小於|以下)?\s*([0-9]+(?:\.[0-9]+)?)",
+            c,
+            flags=re.I,
+        )
+        if m:
+            v = float(m.group(3))
+            if is_hard:
+                hard["max_precursor_cost"] = v
+            else:
+                soft["max_precursor_cost"] = v
+        elif any(k in c for k in ["不要太貴", "別太貴", "便宜優先", "成本低", "省錢"]):
+            soft.setdefault("prefer_low_cost", True)
+
+        # leaf / 前驅物數
+        m = re.search(
+            r"(leaf|前驅物|終端前驅物)\s*(<=|<|不超過|低於|小於|以下)?\s*([0-9]+|[一二兩三四五六七八九十]{1,3})",
+            c,
+            flags=re.I,
+        )
+        if m:
+            n = _zh_num_to_int(m.group(3))
+            if n > 0:
+                if is_hard:
+                    hard["max_leaf_precursors"] = n
+                else:
+                    soft["max_leaf_precursors"] = n
+
+    if any(k in lower for k in ["不能", "禁止", "avoid", "ban"]):
+        toks = re.findall(r"(?:禁用|禁止|avoid|ban)\s*[:：]?\s*([A-Za-z0-9@+\-=\[\]\(\)#\\/\.]+)", text, flags=re.I)
+        if toks:
+            hard["banned_tokens"] = toks
+
+    # 溶劑/安全語意映射（MVP）
+    if any(k in lower for k in ["含氯溶劑", "鹵素溶劑", "halogen solvent", "chlorinated solvent"]):
+        hard.setdefault("banned_tokens", [])
+        hard["banned_tokens"].extend(["ClCCl", "ClCl", "CH2Cl2", "CCl4"])
+    if any(k in lower for k in ["高危", "high hazard", "危險分子禁用", "不要高危"]):
+        hard["forbid_high_hazard"] = True
+    if any(k in lower for k in ["有毒盡量避免", "盡量不要有毒", "avoid toxic", "toxic avoid"]):
+        soft["prefer_low_hazard"] = True
+    if any(k in lower for k in ["供應穩定", "穩定供應", "supply stable"]):
+        soft["prefer_supply_stability"] = True
+
+    # 去重
+    if isinstance(hard.get("banned_tokens"), list):
+        seen = set()
+        dedup = []
+        for x in hard["banned_tokens"]:
+            s = str(x).strip()
+            if s and s not in seen:
+                dedup.append(s)
+                seen.add(s)
+        hard["banned_tokens"] = dedup
+    return {"hard": hard, "soft": soft}
+
+
+def _merge_constraints(structured: Dict[str, Any], text_constraints: Dict[str, Any]) -> Dict[str, Any]:
+    out = {"hard": {}, "soft": {}}
+    for scope in ("hard", "soft"):
+        src_a = structured.get(scope, {}) if isinstance(structured, dict) else {}
+        src_b = text_constraints.get(scope, {}) if isinstance(text_constraints, dict) else {}
+        if isinstance(src_a, dict):
+            out[scope].update(src_a)
+        if isinstance(src_b, dict):
+            out[scope].update(src_b)
+    return out
+
+
+def _evaluate_constraints(
+    *,
+    route: Dict[str, Any],
+    hard_constraints: Dict[str, Any],
+    soft_constraints: Dict[str, Any],
+) -> Dict[str, Any]:
+    hard_violations: List[str] = []
+    soft_violations: List[str] = []
+    soft_penalty = 0.0
+    checks = 0
+    violated = 0
+
+    depth = int(route.get("depth") or route.get("num_reactions") or 0)
+    cost = _safe_float(route.get("precursor_cost"), 0.0)
+    n_leaf = int(route.get("num_leaf_precursors") or 0)
+    text_blob = " ".join((route.get("reaction_nodes") or []) + (route.get("leaf_chemicals") or []))
+
+    if "max_depth" in hard_constraints:
+        checks += 1
+        lim = int(hard_constraints.get("max_depth", 0))
+        if depth > lim:
+            violated += 1
+            hard_violations.append(f"depth>{lim} (actual={depth})")
+    if "max_precursor_cost" in hard_constraints:
+        checks += 1
+        lim = _safe_float(hard_constraints.get("max_precursor_cost"), 1e18)
+        if cost > lim:
+            violated += 1
+            hard_violations.append(f"precursor_cost>{lim:.4f} (actual={cost:.4f})")
+    if "max_leaf_precursors" in hard_constraints:
+        checks += 1
+        lim = int(hard_constraints.get("max_leaf_precursors", 10**9))
+        if n_leaf > lim:
+            violated += 1
+            hard_violations.append(f"num_leaf_precursors>{lim} (actual={n_leaf})")
+    for t in (hard_constraints.get("banned_tokens") or []):
+        checks += 1
+        tok = str(t).strip()
+        if tok and tok in text_blob:
+            violated += 1
+            hard_violations.append(f"banned_token={tok}")
+
+    if "max_precursor_cost" in soft_constraints:
+        checks += 1
+        lim = _safe_float(soft_constraints.get("max_precursor_cost"), 1e18)
+        if cost > lim:
+            violated += 1
+            ratio = (cost - lim) / max(1e-6, lim)
+            p = min(0.30, 0.10 + 0.30 * ratio)
+            soft_penalty += p
+            soft_violations.append(f"soft_cost>{lim:.4f} (actual={cost:.4f}, penalty={p:.3f})")
+    if "max_leaf_precursors" in soft_constraints:
+        checks += 1
+        lim = int(soft_constraints.get("max_leaf_precursors", 10**9))
+        if n_leaf > lim:
+            violated += 1
+            p = min(0.25, 0.08 * (n_leaf - lim))
+            soft_penalty += p
+            soft_violations.append(f"soft_leaf>{lim} (actual={n_leaf}, penalty={p:.3f})")
+    if "max_depth" in soft_constraints:
+        checks += 1
+        lim = int(soft_constraints.get("max_depth", 10**9))
+        if depth > lim:
+            violated += 1
+            p = min(0.25, 0.08 * (depth - lim))
+            soft_penalty += p
+            soft_violations.append(f"soft_depth>{lim} (actual={depth}, penalty={p:.3f})")
+
+    satisfaction_rate = 1.0 if checks <= 0 else max(0.0, min(1.0, 1.0 - (violated / checks)))
+    return {
+        "hard_violations": hard_violations,
+        "soft_violations": soft_violations,
+        "soft_penalty": max(0.0, min(0.7, soft_penalty)),
+        "checks": checks,
+        "violated": violated,
+        "satisfaction_rate": satisfaction_rate,
+    }
+
+
+def _build_relaxation_suggestions(hard_reject_reasons: List[str], hard_constraints: Dict[str, Any]) -> List[str]:
+    if not hard_reject_reasons:
+        return []
+    suggestions: List[str] = []
+    if any("depth>" in x for x in hard_reject_reasons) and "max_depth" in hard_constraints:
+        suggestions.append(
+            f"可放寬 max_depth：{hard_constraints.get('max_depth')} -> {int(hard_constraints.get('max_depth', 0)) + 1}"
+        )
+    if any("precursor_cost>" in x for x in hard_reject_reasons) and "max_precursor_cost" in hard_constraints:
+        v = _safe_float(hard_constraints.get("max_precursor_cost"), 0.0)
+        suggestions.append(f"可放寬 max_precursor_cost：{v:.2f} -> {v * 1.15:.2f}")
+    if any("num_leaf_precursors>" in x for x in hard_reject_reasons) and "max_leaf_precursors" in hard_constraints:
+        suggestions.append(
+            f"可放寬 max_leaf_precursors：{hard_constraints.get('max_leaf_precursors')} -> {int(hard_constraints.get('max_leaf_precursors', 0)) + 1}"
+        )
+    if any("banned_token=" in x for x in hard_reject_reasons):
+        suggestions.append("檢視 banned_tokens 是否過嚴，可改為 soft 規則或只禁用 high-risk token。")
+    return suggestions[:6]
+
+
+def _vote_label(score: float, rejected: bool, t_low: float, t_high: float) -> str:
+    if rejected:
+        return "reject"
+    if score < t_low:
+        return "reject"
+    if score >= t_high:
+        return "approve"
+    return "neutral"
+
+
+def _build_critic_votes(
+    *,
+    cost_score: float,
+    success_score: float,
+    safety_score: float,
+    supply_score: float,
+    rejected: bool,
+    vote_low_threshold: float,
+    vote_high_threshold: float,
+) -> Dict[str, str]:
+    return {
+        "cost_agent": _vote_label(cost_score, False, vote_low_threshold, vote_high_threshold),
+        "success_agent": _vote_label(success_score, False, vote_low_threshold, vote_high_threshold),
+        "safety_agent": _vote_label(safety_score, rejected, vote_low_threshold, vote_high_threshold),
+        "supply_agent": _vote_label(supply_score, False, vote_low_threshold, vote_high_threshold),
+    }
+
+
+def _disagreement_std(vals: List[float]) -> float:
+    if not vals:
+        return 0.0
+    mean = sum(vals) / len(vals)
+    var = sum((x - mean) ** 2 for x in vals) / len(vals)
+    return math.sqrt(max(0.0, var))
+
+
 def run_askcos_route_recommendation(
     target_smiles: str,
     objective: str = "balanced",
@@ -466,6 +748,12 @@ def run_askcos_route_recommendation(
     enable_pubchem_hazard: bool = True,
     hazard_leaf_only: bool = True,
     max_unique_hazard_checks: int = 120,
+    vote_low_threshold: float = 0.33,
+    vote_high_threshold: float = 0.67,
+    contested_std_threshold: float = 0.25,
+    constraints: Dict[str, Any] = None,
+    constraint_text: str = "",
+    constraint_parse_mode: str = "hybrid",
     use_cache: bool = True,
 ) -> str:
     if not target_smiles:
@@ -491,6 +779,12 @@ def run_askcos_route_recommendation(
         enable_pubchem_hazard=enable_pubchem_hazard,
         hazard_leaf_only=hazard_leaf_only,
         max_unique_hazard_checks=max_unique_hazard_checks,
+        vote_low_threshold=vote_low_threshold,
+        vote_high_threshold=vote_high_threshold,
+        contested_std_threshold=contested_std_threshold,
+        constraints=constraints or {},
+        constraint_text=constraint_text,
+        constraint_parse_mode=constraint_parse_mode,
     )
     if use_cache:
         hit = cache.get(cache_key)
@@ -512,12 +806,28 @@ def run_askcos_route_recommendation(
         return "未取得可分析路線（uds.pathways 為空）。"
 
     routes = [route_summary(r) for r in routes_raw]
+    mode = (constraint_parse_mode or "hybrid").strip().lower()
+    if mode == "llm_only":
+        # LLM 解析結果應由外部傳入 constraints；此處不再做規則抽取
+        text_constraints = {"hard": {}, "soft": {}}
+    elif mode == "rule_only":
+        text_constraints = _parse_constraint_text(constraint_text)
+        constraints = {}
+    else:
+        # hybrid: 規則 + 外部（可為 LLM）融合
+        text_constraints = _parse_constraint_text(constraint_text)
+    merged_constraints = _merge_constraints(constraints or {}, text_constraints)
+    hard_constraints = merged_constraints.get("hard", {}) if isinstance(merged_constraints.get("hard"), dict) else {}
+    soft_constraints = merged_constraints.get("soft", {}) if isinstance(merged_constraints.get("soft"), dict) else {}
+    constrained_banned = [x for x in (hard_constraints.get("banned_tokens") or []) if str(x).strip()]
+    effective_banned_tokens = (banned_tokens or []) + constrained_banned
+
     cost = _cost_agent(routes)
     succ = _success_agent(routes)
     supply = _supply_agent(routes)
     safety, rejected = _safety_agent(
         routes,
-        banned_tokens or [],
+        effective_banned_tokens,
         enable_pubchem_hazard=enable_pubchem_hazard,
         hazard_leaf_only=hazard_leaf_only,
         max_unique_hazard_checks=max_unique_hazard_checks,
@@ -531,12 +841,46 @@ def run_askcos_route_recommendation(
         s = succ[rid]["score"]
         y = supply[rid]["score"]
         f = safety[rid]["score"]
+        is_rejected = rid in rejected
+        c_eval = _evaluate_constraints(
+            route=r,
+            hard_constraints=hard_constraints,
+            soft_constraints=soft_constraints,
+        )
+        hard_violations = c_eval["hard_violations"]
+        soft_violations = c_eval["soft_violations"]
+        soft_penalty = _safe_float(c_eval["soft_penalty"], 0.0)
+        if hard_violations:
+            is_rejected = True
+        votes = _build_critic_votes(
+            cost_score=c,
+            success_score=s,
+            safety_score=f,
+            supply_score=y,
+            rejected=is_rejected,
+            vote_low_threshold=vote_low_threshold,
+            vote_high_threshold=vote_high_threshold,
+        )
+        approve_count = sum(1 for v in votes.values() if v == "approve")
+        reject_count = sum(1 for v in votes.values() if v == "reject")
+        neutral_count = sum(1 for v in votes.values() if v == "neutral")
+        std_val = _disagreement_std([c, s, f, y])
+        has_vote_conflict = approve_count > 0 and reject_count > 0
+        contested = bool((std_val >= contested_std_threshold or has_vote_conflict) and not is_rejected)
+        contested_reason = []
+        if std_val >= contested_std_threshold:
+            contested_reason.append(f"high_disagreement_std={std_val:.3f}")
+        if has_vote_conflict:
+            contested_reason.append(
+                f"vote_conflict(approve={approve_count}, reject={reject_count}, neutral={neutral_count})"
+            )
         final = (
             weights["cost"] * c
             + weights["success"] * s
             + weights["safety"] * f
             + weights["supply"] * y
         )
+        final = max(0.0, min(1.0, final - soft_penalty))
         scored.append(
             {
                 **r,
@@ -547,14 +891,32 @@ def run_askcos_route_recommendation(
                     "safety_agent": safety[rid],
                     "supply_agent": supply[rid],
                 },
-                "rejected": rid in rejected,
-                "reject_reasons": rejected.get(rid, []),
+                "critic_votes": votes,
+                "vote_summary": {
+                    "approve": approve_count,
+                    "neutral": neutral_count,
+                    "reject": reject_count,
+                },
+                "disagreement_std": std_val,
+                "contested": contested,
+                "contested_reason": contested_reason,
+                "rejected": is_rejected,
+                "constraint_eval": c_eval,
+                "reject_reasons": (rejected.get(rid, []) + [f"constraint_reject: {x}" for x in hard_violations]),
+                "soft_penalty": soft_penalty,
+                "soft_violations": soft_violations,
             }
         )
 
     survivors = [x for x in scored if not x["rejected"]]
     survivors.sort(key=lambda x: x["final_score"], reverse=True)
     dropped = [x for x in scored if x["rejected"]]
+    contested_routes = [x for x in survivors if x.get("contested")]
+    contested_routes.sort(key=lambda x: x.get("disagreement_std", 0.0), reverse=True)
+    hard_reject_reason_pool = []
+    for x in dropped:
+        hard_reject_reason_pool.extend([r for r in (x.get("reject_reasons") or []) if "constraint_reject:" in r])
+    relaxation_suggestions = _build_relaxation_suggestions(hard_reject_reason_pool, hard_constraints)
 
     lines = [
         "AskCOS 路線推薦（多 Agent 評估）",
@@ -563,7 +925,11 @@ def run_askcos_route_recommendation(
         f"- 搜尋統計: total_paths={stats.get('total_paths')}, total_chemicals={stats.get('total_chemicals')}, total_reactions={stats.get('total_reactions')}",
         f"- PubChem hazard: {'on' if enable_pubchem_hazard else 'off'} (max_unique_hazard_checks={max_unique_hazard_checks})",
         f"- Agent 權重: {weights}",
+        f"- Vote thresholds: low={vote_low_threshold:.2f}, high={vote_high_threshold:.2f}, contested_std={contested_std_threshold:.2f}",
+        f"- Constraints(hard): {hard_constraints if hard_constraints else '{}'}",
+        f"- Constraints(soft): {soft_constraints if soft_constraints else '{}'}",
         f"- 安全剔除: {len(dropped)} 條, 保留: {len(survivors)} 條",
+        f"- 低共識(contested): {len(contested_routes)} 條",
         "",
         f"=== 推薦 Top {min(top_n, len(survivors))} ===",
     ]
@@ -576,9 +942,21 @@ def run_askcos_route_recommendation(
                 f"  success_agent={r['agent_scores']['success_agent']['score']:.4f} ({r['agent_scores']['success_agent']['reason']})",
                 f"  safety_agent={r['agent_scores']['safety_agent']['score']:.4f} ({r['agent_scores']['safety_agent']['reason']})",
                 f"  supply_agent={r['agent_scores']['supply_agent']['score']:.4f} ({r['agent_scores']['supply_agent']['reason']})",
+                f"  votes={r.get('critic_votes')} summary={r.get('vote_summary')} disagreement_std={r.get('disagreement_std',0.0):.3f} contested={r.get('contested')}",
+                f"  constraint_satisfaction={r.get('constraint_eval',{}).get('satisfaction_rate',1.0):.3f} soft_penalty={r.get('soft_penalty',0.0):.3f}",
+                f"  soft_violations={r.get('soft_violations')}",
                 f"  leaves={', '.join((r.get('leaf_chemicals') or [])[:4])}",
             ]
         )
+
+    if contested_routes:
+        lines.append("")
+        lines.append("=== 低共識路線（contested，前 10）===")
+        for r in contested_routes[:10]:
+            lines.append(
+                f"- route_id={r.get('route_id')} disagreement_std={r.get('disagreement_std',0.0):.3f} "
+                f"votes={r.get('vote_summary')} reasons={'; '.join(r.get('contested_reason') or ['n/a'])}"
+            )
 
     if dropped:
         lines.append("")
@@ -587,6 +965,12 @@ def run_askcos_route_recommendation(
             lines.append(
                 f"- route_id={r.get('route_id')} reasons={'; '.join(r.get('reject_reasons') or ['unknown'])}"
             )
+
+    if relaxation_suggestions:
+        lines.append("")
+        lines.append("=== Constraint 放寬建議（自動）===")
+        for s in relaxation_suggestions:
+            lines.append(f"- {s}")
 
     text = "\n".join(lines)
     if use_cache:

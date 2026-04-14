@@ -24,6 +24,11 @@ from forward_prediction import (
 )
 from impurity_prediction import run_askcos_impurity_prediction
 from multistep_retrosynthesis import (
+    run_askcos_multistep_retrosynthesis_async_find,
+    run_askcos_multistep_retrosynthesis_async_list_jobs,
+    run_askcos_multistep_retrosynthesis_async_result,
+    run_askcos_multistep_retrosynthesis_async_status,
+    run_askcos_multistep_retrosynthesis_async_submit,
     run_askcos_multistep_retrosynthesis,
     run_askcos_multistep_retrosynthesis_compare,
     run_askcos_multistep_retrosynthesis_retro_star,
@@ -380,8 +385,20 @@ def _build_heuristic_plan(user_prompt: str, available_tool_names: List[str]) -> 
                 [
                     "run_askcos_multistep_retrosynthesis",
                     "run_askcos_multistep_retrosynthesis_retro_star",
+                    "run_askcos_multistep_retrosynthesis_async_submit",
+                    "run_askcos_multistep_retrosynthesis_async_status",
+                    "run_askcos_multistep_retrosynthesis_async_result",
                 ]
             )
+    if any(k in lower for k in ["背景", "job", "任務", "剛剛", "結果如何", "status", "狀態"]):
+        candidates.extend(
+            [
+                "run_askcos_multistep_retrosynthesis_async_find",
+                "run_askcos_multistep_retrosynthesis_async_list_jobs",
+                "run_askcos_multistep_retrosynthesis_async_status",
+                "run_askcos_multistep_retrosynthesis_async_result",
+            ]
+        )
         if compare_allowed:
             candidates.append("run_askcos_retrosynthesis_compare")
             if multistep:
@@ -525,6 +542,62 @@ def _extract_smiles_from_resolver_output(text: str) -> str:
     return extract_smiles_candidate(text)
 
 
+def _normalize_constraints_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    out = {"hard": {}, "soft": {}}
+    if not isinstance(data, dict):
+        return out
+    for scope in ("hard", "soft"):
+        block = data.get(scope, {})
+        if not isinstance(block, dict):
+            continue
+        cleaned: Dict[str, Any] = {}
+        for k, v in block.items():
+            if k in {"max_depth", "max_leaf_precursors"}:
+                try:
+                    cleaned[k] = int(v)
+                except Exception:
+                    continue
+            elif k in {"max_precursor_cost"}:
+                try:
+                    cleaned[k] = float(v)
+                except Exception:
+                    continue
+            elif k in {"forbid_high_hazard", "prefer_low_cost", "prefer_low_hazard", "prefer_supply_stability"}:
+                cleaned[k] = bool(v)
+            elif k == "banned_tokens":
+                if isinstance(v, list):
+                    cleaned[k] = [str(x).strip() for x in v if str(x).strip()]
+                elif isinstance(v, str) and v.strip():
+                    cleaned[k] = [v.strip()]
+            else:
+                # 允許擴充欄位，但做基本序列化
+                cleaned[k] = v
+        out[scope] = cleaned
+    return out
+
+
+def _llm_parse_constraints(user_prompt: str) -> Dict[str, Any]:
+    prompt = (
+        "你是化學流程限制解析器。請把使用者要求轉成 JSON，格式必須是："
+        "{\"hard\": {...}, \"soft\": {...}}。\n"
+        "可用欄位包含：max_depth, max_precursor_cost, max_leaf_precursors, banned_tokens, "
+        "forbid_high_hazard, prefer_low_cost, prefer_low_hazard, prefer_supply_stability。\n"
+        "規則：\n"
+        "- 明確禁止/不能/必須遵守 => hard\n"
+        "- 盡量/優先/希望 => soft\n"
+        "- 若沒有對應限制，回傳空物件。\n"
+        f"user_prompt={user_prompt}"
+    )
+    try:
+        provider = AUX_PROVIDER
+        model = GROQ_AUX_MODEL if provider == "groq" else AUX_MODEL
+        text = _generate_text(prompt=prompt, model=model, provider=provider, timeout_sec=25)
+        data = _extract_json_block(text)
+        return _normalize_constraints_payload(data if isinstance(data, dict) else {})
+    except Exception:
+        return {"hard": {}, "soft": {}}
+
+
 def _default_args_for_tool(tool_name: str, user_prompt: str, resolved_smiles: str = "") -> Dict[str, Any]:
     reaction_smiles = resolved_smiles if ">>" in resolved_smiles else extract_smiles_candidate(user_prompt)
     name_candidate = extract_name_candidate(user_prompt)
@@ -534,6 +607,20 @@ def _default_args_for_tool(tool_name: str, user_prompt: str, resolved_smiles: st
     if tool_name.startswith("run_askcos_retrosynthesis"):
         return {"smiles_list": [molecule_smiles] if molecule_smiles else [], "max_routes": 3}
     if tool_name.startswith("run_askcos_multistep_retrosynthesis"):
+        if "async_find" in tool_name:
+            return {"query": user_prompt, "auto_result": True}
+        if "async_list_jobs" in tool_name:
+            return {"limit": 10}
+        if "async_status" in tool_name or "async_result" in tool_name:
+            return {"job_id": ""}
+        if "async_submit" in tool_name:
+            return {
+                "target_smiles": molecule_smiles,
+                "backend": "mcts",
+                "max_depth": 6,
+                "max_paths": 8,
+                "expansion_time": 180,
+            }
         return {"target_smiles": molecule_smiles, "max_depth": 6, "max_paths": 5, "expansion_time": 45}
     if tool_name == "run_askcos_route_recommendation":
         objective = "balanced"
@@ -544,6 +631,15 @@ def _default_args_for_tool(tool_name: str, user_prompt: str, resolved_smiles: st
             objective = "highest_success"
         elif "最安全" in user_prompt or "safest" in lower:
             objective = "safest"
+        rule_hint = {
+            "hard": {},
+            "soft": {},
+        }
+        llm_hint = _llm_parse_constraints(user_prompt)
+        merged_constraints = {
+            "hard": {**rule_hint.get("hard", {}), **llm_hint.get("hard", {})},
+            "soft": {**rule_hint.get("soft", {}), **llm_hint.get("soft", {})},
+        }
         return {
             "target_smiles": molecule_smiles,
             "objective": objective,
@@ -554,6 +650,9 @@ def _default_args_for_tool(tool_name: str, user_prompt: str, resolved_smiles: st
             "top_n": 10,
             "enable_pubchem_hazard": True,
             "max_unique_hazard_checks": 120,
+            "constraint_text": user_prompt,
+            "constraint_parse_mode": "hybrid",
+            "constraints": merged_constraints,
         }
     if tool_name.startswith("run_askcos_forward_prediction"):
         reactants = reaction_smiles.split(".") if reaction_smiles and ">>" not in reaction_smiles else ([molecule_smiles] if molecule_smiles else [])
@@ -601,6 +700,30 @@ def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
             cleaned["n_conditions"] = cleaned.pop("top_k")
 
     if tool_name.startswith("run_askcos_multistep_retrosynthesis"):
+        if "query_text" in cleaned and "query" not in cleaned:
+            cleaned["query"] = cleaned.pop("query_text")
+        if "keyword" in cleaned and "query" not in cleaned:
+            cleaned["query"] = cleaned.pop("keyword")
+        if "job" in cleaned and "job_id" not in cleaned:
+            cleaned["job_id"] = cleaned.pop("job")
+        if "id" in cleaned and "job_id" not in cleaned:
+            cleaned["job_id"] = cleaned.pop("id")
+        if "async_status" in tool_name or "async_result" in tool_name:
+            cleaned.pop("target_smiles", None)
+            cleaned.pop("smiles", None)
+            cleaned.pop("target", None)
+            return cleaned
+        if "async_find" in tool_name:
+            cleaned.pop("job_id", None)
+            cleaned.setdefault("query", "")
+            cleaned.setdefault("auto_result", True)
+            return cleaned
+        if "async_list_jobs" in tool_name:
+            cleaned.pop("job_id", None)
+            cleaned.setdefault("limit", 10)
+            return cleaned
+        if "backend_label" in cleaned and "backend" not in cleaned:
+            cleaned["backend"] = cleaned.pop("backend_label")
         if "num_paths" in cleaned and "max_paths" not in cleaned:
             cleaned["max_paths"] = cleaned.pop("num_paths")
         if "max_steps" in cleaned and "max_depth" not in cleaned:
@@ -628,6 +751,9 @@ def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
         cleaned.setdefault("enable_pubchem_hazard", True)
         cleaned.setdefault("hazard_leaf_only", True)
         cleaned.setdefault("max_unique_hazard_checks", 120)
+        cleaned.setdefault("constraint_text", "")
+        cleaned.setdefault("constraint_parse_mode", "hybrid")
+        cleaned.setdefault("constraints", {})
         cleaned.setdefault("use_cache", True)
 
     if tool_name == "run_askcos_impurity_prediction":
@@ -1096,6 +1222,11 @@ askcos_tools = [
     run_askcos_multistep_retrosynthesis,
     run_askcos_multistep_retrosynthesis_retro_star,
     run_askcos_multistep_retrosynthesis_compare,
+    run_askcos_multistep_retrosynthesis_async_submit,
+    run_askcos_multistep_retrosynthesis_async_list_jobs,
+    run_askcos_multistep_retrosynthesis_async_find,
+    run_askcos_multistep_retrosynthesis_async_status,
+    run_askcos_multistep_retrosynthesis_async_result,
     run_askcos_route_recommendation,
     run_askcos_impurity_prediction,
     resolve_smiles_from_name,
