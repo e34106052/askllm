@@ -22,7 +22,6 @@ from forward_prediction import (
     run_askcos_forward_prediction_uspto_stereo,
     run_askcos_forward_prediction_wldn5,
 )
-from image_tool import generate_molecule_image
 from impurity_prediction import run_askcos_impurity_prediction
 from multistep_retrosynthesis import (
     run_askcos_multistep_retrosynthesis,
@@ -98,7 +97,7 @@ CONDITIONAL_SKILL_RULES = [
     ("02-ambiguity.md", ["co", "no", " p ", "smiles", "分子式", "結構式", "歧義", "縮寫"]),
     ("03-name-resolution.md", ["名稱", "name", "翻譯", "smiles", "化合物", "compound", "分子"]),
     ("04-condition-priority.md", ["條件", "condition", "yield", "產率", "buchwald", "grignard", "chan-lam"]),
-    ("05-task-routing.md", ["逆合成", "retrosynthesis", "forward", "正向", "雜質", "impurity", "圖片", "image", "路徑", "mcts"]),
+    ("05-task-routing.md", ["逆合成", "retrosynthesis", "forward", "正向", "雜質", "impurity", "路徑", "mcts"]),
     ("06-formatting.md", ["輸出", "格式", "temperature", "probability", "score", "top 5", "攝氏", "表格"]),
 ]
 
@@ -396,9 +395,6 @@ def _build_heuristic_plan(user_prompt: str, available_tool_names: List[str]) -> 
             candidates.append("run_askcos_condition_prediction_compare")
     if any(k in lower for k in ["雜質", "impurity", "副產物"]):
         candidates.append("run_askcos_impurity_prediction")
-    if any(k in lower for k in ["圖片", "image", "結構圖"]):
-        candidates.append("generate_molecule_image")
-
     if len(candidates) == 1:
         candidates.extend(
             [
@@ -543,8 +539,6 @@ def _default_args_for_tool(tool_name: str, user_prompt: str, resolved_smiles: st
         return {"reaction_smiles": reaction_smiles, "n_conditions": 5}
     if tool_name == "run_askcos_impurity_prediction":
         return {"reactants_smiles": reaction_smiles or molecule_smiles}
-    if tool_name == "generate_molecule_image":
-        return {"smiles": molecule_smiles, "file_prefix": "molecule"}
     return {}
 
 
@@ -1061,7 +1055,6 @@ askcos_tools = [
     run_askcos_multistep_retrosynthesis,
     run_askcos_multistep_retrosynthesis_retro_star,
     run_askcos_multistep_retrosynthesis_compare,
-    generate_molecule_image,
     run_askcos_impurity_prediction,
     resolve_smiles_from_name,
     run_askcos_condition_prediction,

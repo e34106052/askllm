@@ -52,7 +52,6 @@
 - 其他
   - `run_askcos_impurity_prediction`
   - `resolve_smiles_from_name`
-  - `generate_molecule_image`
 
 > `run_advanced_condition_prediction` 已保留 shim（`reaction_yield.py`）但不在 active tools。
 

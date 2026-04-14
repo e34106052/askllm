@@ -3,4 +3,3 @@ __pycache__/
 .askllm_memory/
 .askllm_cache/
 outputs/
-generated_mol_images/
