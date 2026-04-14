@@ -39,6 +39,7 @@ from policies import (
     recent_effective_evidence,
 )
 from providers import QuotaLimitError, chat_with_groq, format_quota_help_message
+from route_recommendation import run_askcos_route_recommendation
 from retrosynthesis import (
     run_askcos_retrosynthesis,
     run_askcos_retrosynthesis_compare,
@@ -395,6 +396,8 @@ def _build_heuristic_plan(user_prompt: str, available_tool_names: List[str]) -> 
             candidates.append("run_askcos_condition_prediction_compare")
     if any(k in lower for k in ["雜質", "impurity", "副產物"]):
         candidates.append("run_askcos_impurity_prediction")
+    if any(k in lower for k in ["推薦路線", "路線推薦", "最便宜", "成功率最高", "highest_success", "cheapest"]):
+        candidates.append("run_askcos_route_recommendation")
     if len(candidates) == 1:
         candidates.extend(
             [
@@ -532,6 +535,26 @@ def _default_args_for_tool(tool_name: str, user_prompt: str, resolved_smiles: st
         return {"smiles_list": [molecule_smiles] if molecule_smiles else [], "max_routes": 3}
     if tool_name.startswith("run_askcos_multistep_retrosynthesis"):
         return {"target_smiles": molecule_smiles, "max_depth": 6, "max_paths": 5, "expansion_time": 45}
+    if tool_name == "run_askcos_route_recommendation":
+        objective = "balanced"
+        lower = (user_prompt or "").lower()
+        if "最便宜" in user_prompt or "cheapest" in lower:
+            objective = "cheapest"
+        elif "成功率最高" in user_prompt or "highest_success" in lower:
+            objective = "highest_success"
+        elif "最安全" in user_prompt or "safest" in lower:
+            objective = "safest"
+        return {
+            "target_smiles": molecule_smiles,
+            "objective": objective,
+            "backend": "mcts",
+            "max_depth": 5,
+            "max_paths": 120,
+            "expansion_time": 180,
+            "top_n": 10,
+            "enable_pubchem_hazard": True,
+            "max_unique_hazard_checks": 120,
+        }
     if tool_name.startswith("run_askcos_forward_prediction"):
         reactants = reaction_smiles.split(".") if reaction_smiles and ">>" not in reaction_smiles else ([molecule_smiles] if molecule_smiles else [])
         return {"reactants_smiles_list": reactants, "top_k": 3}
@@ -588,6 +611,24 @@ def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
             cleaned["target_smiles"] = cleaned["target"]
         cleaned.pop("smiles", None)
         cleaned.pop("target", None)
+
+    if tool_name == "run_askcos_route_recommendation":
+        if "smiles" in cleaned and "target_smiles" not in cleaned:
+            cleaned["target_smiles"] = cleaned["smiles"]
+        if "target" in cleaned and "target_smiles" not in cleaned:
+            cleaned["target_smiles"] = cleaned["target"]
+        cleaned.pop("smiles", None)
+        cleaned.pop("target", None)
+        cleaned.setdefault("objective", "balanced")
+        cleaned.setdefault("backend", "mcts")
+        cleaned.setdefault("max_depth", 5)
+        cleaned.setdefault("max_paths", 120)
+        cleaned.setdefault("expansion_time", 180)
+        cleaned.setdefault("top_n", 10)
+        cleaned.setdefault("enable_pubchem_hazard", True)
+        cleaned.setdefault("hazard_leaf_only", True)
+        cleaned.setdefault("max_unique_hazard_checks", 120)
+        cleaned.setdefault("use_cache", True)
 
     if tool_name == "run_askcos_impurity_prediction":
         if "reaction_smiles" in cleaned and "reactants_smiles" not in cleaned:
@@ -1055,6 +1096,7 @@ askcos_tools = [
     run_askcos_multistep_retrosynthesis,
     run_askcos_multistep_retrosynthesis_retro_star,
     run_askcos_multistep_retrosynthesis_compare,
+    run_askcos_route_recommendation,
     run_askcos_impurity_prediction,
     resolve_smiles_from_name,
     run_askcos_condition_prediction,
